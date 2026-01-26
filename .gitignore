@@ -20,5 +20,6 @@ modules.order
 *.jou
 *.log
 *.str
+*.xml
 
 tags
