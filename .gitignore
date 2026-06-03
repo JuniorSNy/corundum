@@ -22,3 +22,6 @@ modules.order
 *.str
 
 tags
+
+__pycache__/
+*.py[cod]
