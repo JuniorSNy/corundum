@@ -264,8 +264,19 @@ always @* begin
     cq_sop_int_next = cq_sop_int_reg;
     cq_eop_int_next = cq_eop_int_reg;
 
+    // CQ 接收整体流程（概念上是一个“隐式状态机”，由 cq_frame_reg/tlp_frame_reg 这类标志位驱动）：
+    // 1) 上游 Xilinx CQ AXIS 用 s_axis_cq_tvalid/tready 握手；本模块用 fifo_tlp_ready 直接反压。
+    // 2) 握手成功时，把“本拍解码后的 CQ 信息”锁存到 *_int_reg 作为 1 拍缓存（skid buffer）。
+    // 3) 组合逻辑同时查看当前拍(cq_*) + 上一拍缓存(*_int_reg)，拼成 *_full，实现跨拍拼接/提前窥视下一拍边界。
+    // 4) 当 fifo_tlp_ready=1 时，从 *_full 中提取 payload、组装 tlp_hdr/bar_id/func_num，并推入 pcie_tlp_fifo。
+
     // decode framing
     if (CQ_STRADDLE && AXIS_PCIE_DATA_WIDTH >= 512) begin
+        // Straddle 模式（512-bit CQ）：一拍可能包含 2 个 TLP segment。
+        // Xilinx 用 tuser 中的 SOP/EOP 指示每个 segment 的起止位置，本段逻辑把它们转换成：
+        // - cq_sop/cq_eop：每个 segment 是否在该拍开始/结束
+        // - cq_strb：每个 DWORD 是否有效（从 SOP 开始一直拉到 EOP 结束）
+        // - cq_valid：与 cq_strb 对齐的有效标志（受 tvalid 控制）
         cq_data = s_axis_cq_tdata;
         cq_strb = 0;
         cq_hdr_be = {s_axis_cq_tuser[15:12], s_axis_cq_tuser[7:4], s_axis_cq_tuser[11:8], s_axis_cq_tuser[3:0]};
@@ -298,6 +309,9 @@ always @* begin
             end
         end
     end else begin
+        // 非 straddle：一拍只承载一个 TLP（INT_TLP_SEG_COUNT=1）。
+        // SOP 由 cq_frame_reg 推导：上一拍未结束则仍处于 frame 内；否则当前拍即 SOP。
+        // EOP 直接来自 s_axis_cq_tlast。
         cq_data = s_axis_cq_tdata;
         cq_strb = s_axis_cq_tvalid ? s_axis_cq_tkeep : 0;
         if (AXIS_PCIE_DATA_WIDTH >= 512) begin
@@ -322,6 +336,10 @@ always @* begin
 
     for (seg = 0; seg < INT_TLP_SEG_COUNT; seg = seg + 1) begin
         // parse header
+        // Xilinx CQ header 字段到通用 TLP header 的映射：
+        // - 本模块根据 request type（CQ DW0[78:75]）选择 TLP fmt/type（读=无数据，写=带数据等）。
+        // - 其余字段（TC/attr/AT/length/requester ID/tag/BE/address）从 CQ header 直接搬运/重排。
+        // - bar_id/func_num 单独抽出，后续随 tlp_hdr 一起送往 BAR 请求路径。
         // DW 0
         case (cq_data_full[INT_TLP_SEG_DATA_WIDTH*seg+75 +: 4])
             REQ_MEM_READ: begin
@@ -410,11 +428,15 @@ always @* begin
     end
 
     if (fifo_tlp_ready) begin
+        // 当下游 FIFO 可接收时，才会“消费”CQ 数据并生成输出节拍。
+        // 这里会把 CQ 的 data 区（去掉/跳过 CQ header 对应的 DWORD）对齐成 rx_req_tlp_*，
+        // 并用 tlp_frame_reg 跟踪是否处于同一个 TLP 的后续 beat，从而生成 sop/eop/valid。
         rx_req_tlp_strb_next = 0;
         rx_req_tlp_valid_next = 0;
         rx_req_tlp_sop_next = 0;
         rx_req_tlp_eop_next = 0;
         if (TLP_DATA_WIDTH == 64) begin
+            // 64-bit 特例：CQ header/payload 的对齐需要跨拍拼接（通过 *_full 观察上一拍缓存 + 当前拍数据）
             if (cq_valid_full[0]) begin
                 rx_req_tlp_data_next = cq_data_full >> 64;
                 rx_req_tlp_strb_next = cq_strb_full >> 2;
@@ -448,6 +470,8 @@ always @* begin
                 end
             end
         end else begin
+            // 128/256/512-bit：每个 segment 独立处理。若本拍为 SOP，则同步更新对应的 tlp_hdr/bar_id/func_num。
+            // 若遇到 EOP，则根据 strobe 决定该拍是否输出 eop，同时清除对应的 *_int 缓存有效位。
             for (seg = 0; seg < INT_TLP_SEG_COUNT; seg = seg + 1) begin
                 if (cq_valid_full[seg]) begin
                     rx_req_tlp_data_next[INT_TLP_SEG_DATA_WIDTH*seg +: INT_TLP_SEG_DATA_WIDTH] = cq_data_full >> (128 + INT_TLP_SEG_DATA_WIDTH*seg);
@@ -478,6 +502,9 @@ always @* begin
     end
 
     if (s_axis_cq_tready && s_axis_cq_tvalid) begin
+        // 握手时锁存解码后的 CQ 信息，作为 1 拍缓存：
+        // - 对非 straddle：用于在下一拍组合 *_full 时提供“上一拍”的上下文，支持跨拍判断 EOP 等情况
+        // - 对 straddle：同样提供跨拍拼接能力，并把每个 segment 的 sop/eop/strb 对齐保存
         cq_data_int_next = cq_data;
         cq_strb_int_next = cq_strb;
         cq_hdr_be_int_next = cq_hdr_be;
